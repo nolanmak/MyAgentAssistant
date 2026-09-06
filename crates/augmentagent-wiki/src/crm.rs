@@ -521,8 +521,9 @@ pub fn merge_stub_into(target_src: &str, stub_src: &str, stub_slug: &str) -> Stu
     }
 }
 
-/// The `- …` items of a page's `## Source` section, without the bullet.
-fn source_lines(page: &str) -> Vec<String> {
+/// The `- …` items of a page's `## Source` section, without the bullet. Public
+/// so a merge proposal can SHOW this provenance on its approval card (#927).
+pub fn source_lines(page: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_source = false;
     for line in page.lines() {
