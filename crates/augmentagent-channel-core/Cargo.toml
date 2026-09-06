@@ -40,6 +40,9 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+# #954 — the CLI-gate wait/hold deadlines are minutes-to-hours long; the
+# tests drive them with tokio's paused clock instead of sleeping for real.
+tokio = { workspace = true, features = ["test-util"] }
 # #501 — timeparse DST fixture tests pin America/New_York (chrono::Local
 # reads TZ once at process start, so env-pinning in tests is unreliable).
 chrono-tz = { workspace = true }

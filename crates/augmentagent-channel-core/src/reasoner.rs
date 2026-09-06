@@ -265,6 +265,12 @@ pub enum ReasonerError {
     /// adapter says nothing about the others.
     #[error("{message}")]
     Local { message: String },
+    /// #954 — the caller gave up waiting for a #898 CLI-gate permit. Our box
+    /// is saturated (or a permit leaked), which says nothing about the
+    /// provider: never latched, but the chain should still try the next one
+    /// (cerebras is HTTP and ungated).
+    #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
+    GateTimeout { provider: String, waited_secs: u64 },
 }
 
 impl ReasonerError {
@@ -615,6 +621,12 @@ impl ClaudeCliReasoner {
                 provider: "claude".into(),
                 secs,
             })),
+            Err(CallError::GateTimeout { waited_secs }) => {
+                Err(anyhow::Error::new(ReasonerError::GateTimeout {
+                    provider: "claude".into(),
+                    waited_secs,
+                }))
+            }
             // Untyped on purpose — content-level, neither latches nor fails
             // over (#655 review).
             Err(CallError::EmptyOutput) => {
@@ -647,6 +659,12 @@ impl ClaudeCliReasoner {
                                 secs,
                             }));
                         }
+                        Err(CallError::GateTimeout { waited_secs }) => {
+                            return Err(anyhow::Error::new(ReasonerError::GateTimeout {
+                                provider: "claude".into(),
+                                waited_secs,
+                            }));
+                        }
                         Err(CallError::EmptyOutput) => {
                             return Err(anyhow::anyhow!("claude produced no assistant text"));
                         }
@@ -675,7 +693,16 @@ impl ClaudeCliReasoner {
         // queued behind other children must not count against this call.
         // The permit lives to the end of this scope — past the child on
         // every path, including the watchdog dropping `call_once`.
-        let _permit = self.gate.acquire("claude").await;
+        // #954 — the *wait* carries the same budget as the call: an
+        // unbounded queue is how the whole daemon stopped reasoning for 15 h.
+        let _permit = match self.gate.acquire_timed("claude", dur).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(CallError::GateTimeout {
+                    waited_secs: e.waited_secs,
+                })
+            }
+        };
         match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
             Ok(r) => r,
             Err(_) => {
@@ -737,6 +764,9 @@ enum CallError {
     /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
     /// a typed, failover-eligible [`ReasonerError::Timeout`].
     Timeout { secs: u64 },
+    /// #954 — the #898 gate never handed out a permit. No child ever ran, so
+    /// this is our box's fault, not the provider's.
+    GateTimeout { waited_secs: u64 },
     /// The CLI exited 0 but produced no assistant text. Content-level, NOT
     /// provider-side (#655 review): surfaced untyped so it neither latches
     /// the provider nor triggers failover.
@@ -3273,6 +3303,12 @@ mod ask_mode_social_card_allowlist_tests {
 mod failover_error_tests {
     use super::*;
 
+    /// `AUGMENTAGENT_REASONER_TIMEOUT_SECS` is process-global, and since #954
+    /// it also bounds how long a call waits for a gate permit — a test that
+    /// shortens it must not run while another is queueing calls through a
+    /// gate, or the queued ones die on a budget they never asked for.
+    static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
             system_prompt: "stub".into(),
@@ -3371,6 +3407,7 @@ sleep 0.15
 {RESULT_OK}
 "),
         );
+        let _env = TIMEOUT_ENV_LOCK.lock().await;
         let gate = Arc::new(CliGate::new(3));
         let reasoner = Arc::new(ClaudeCliReasoner {
             bin,
@@ -3458,6 +3495,37 @@ sleep 5
         assert_eq!(out, "ok");
     }
 
+    /// #954 — a permit nobody releases must fail the call, not freeze it.
+    /// The typed error is ours, not the provider's, so it latches nothing and
+    /// the chain is free to try the next (ungated) provider.
+    #[tokio::test(start_paused = true)]
+    async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
+        let gate = Arc::new(CliGate::new(1));
+        let leaked = gate.acquire("claude").await;
+        let reasoner = ClaudeCliReasoner {
+            bin: "fake-claude-never-spawned".into(),
+            gate: Arc::clone(&gate),
+        };
+
+        let err = reasoner
+            .call(&dummy_opts(), "hi")
+            .await
+            .expect_err("the only permit is held; the call cannot proceed");
+        match ReasonerError::find_in(&err) {
+            Some(typed @ ReasonerError::GateTimeout { provider, .. }) => {
+                assert_eq!(provider, "claude");
+                assert!(
+                    !typed.is_provider_side(),
+                    "our own gate must never latch a provider cooldown"
+                );
+            }
+            other => panic!("expected GateTimeout, got {other:?}"),
+        }
+        assert_eq!(gate.waiting(), 0);
+        drop(leaked);
+        assert_eq!(gate.in_flight(), 0);
+    }
+
     /// #448's refusal arrives as a SUCCESSFUL completion; post-#656 it must
     /// surface as a downcastable `ReasonerError::RateLimited` with the reset
     /// hint parsed — that's what the fallback chain latches from.
@@ -3504,6 +3572,7 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     async fn hung_cli_times_out_with_typed_error() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
+        let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin,
