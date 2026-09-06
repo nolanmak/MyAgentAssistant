@@ -24,11 +24,10 @@
 //! queued behind them for 15 h: no email triage, no auto-PR loop, no log
 //! line (the saturation warning below only fires *above* capacity, and one
 //! waiter per channel never reaches it). So: the wait is bounded by the
-//! caller's own #656 budget; every permit records who took it and when, so
-//! a hold past that budget is logged and the slot reclaimed (a leak must not
-//! narrow the gate for the life of the process); and the state is published
-//! to [`snapshot_path`], since the gate lives in the daemon's process while
-//! `augmentagent doctor` runs in another one.
+//! caller's own #656 budget; a hold past that budget is logged and the slot
+//! reclaimed, since a leak must not narrow the gate for the life of the
+//! process; and the state is published to [`snapshot_path`], because
+//! `augmentagent doctor` runs outside the daemon's process.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,8 +45,8 @@ pub const ENV_MAX_INFLIGHT: &str = "AUGMENTAGENT_REASONER_MAX_INFLIGHT";
 /// A saturated gate logs at most once per this interval — a 1,700-item
 /// burst must not become 1,700 log lines.
 const SATURATION_WARN_EVERY: Duration = Duration::from_secs(60);
-/// How often a still-queued caller says so. An "is anything stuck" signal,
-/// not a latency measurement.
+/// At most this often, a still-queued caller says so. An "is anything stuck"
+/// signal, not a latency measurement.
 const QUEUED_WARN_EVERY: Duration = Duration::from_secs(60);
 /// A permit held this many times its caller's own watchdog budget has no live
 /// child behind it — #656 kills at 1× and drops the permit with the future.
@@ -125,9 +124,8 @@ impl CliGate {
         self.held().len()
     }
 
-    /// The permit held longest, and for how long. `None` when idle. Without
-    /// it a wedged gate is invisible: the 15 h freeze showed up nowhere except
-    /// as channels quietly not producing work (#954).
+    /// The permit held longest, and for how long. `None` when idle. Without it
+    /// a wedged gate is invisible — the 15 h freeze showed up nowhere (#954).
     pub fn oldest_held(&self) -> Option<(String, Duration)> {
         self.held()
             .values()
@@ -153,12 +151,10 @@ impl CliGate {
 
     /// Wait for a slot for at most `max_wait` — the caller's own watchdog
     /// budget, so a queued call fails the same way a hung child does instead
-    /// of blocking forever (#954); there is deliberately no unbounded
-    /// acquire, since that is precisely the freeze. `max_wait` doubles as
-    /// the hold budget the granted permit promises to finish inside. While
-    /// queued, warns once a minute naming the oldest holder; the saturation
-    /// threshold deliberately does not gate that warning, because one silent
-    /// waiter per channel is the failure shape we are looking for.
+    /// of blocking forever (#954); there is deliberately no unbounded acquire,
+    /// since that is precisely the freeze. `max_wait` doubles as the hold
+    /// budget the granted permit promises to finish inside, and while queued
+    /// the caller warns periodically, naming the oldest holder.
     pub async fn acquire_timed(
         self: &Arc<Self>,
         provider: &str,
@@ -177,9 +173,11 @@ impl CliGate {
         // `sleep` (not `sleep_until`) so an absurd env-set budget saturates
         // instead of overflowing the deadline arithmetic.
         let mut expired = std::pin::pin!(tokio::time::sleep(max_wait));
-        // `interval_at` so the first tick lands a minute in — a permit
-        // granted immediately (the normal case) must not log anything.
-        let mut ticker = tokio::time::interval_at(started + QUEUED_WARN_EVERY, QUEUED_WARN_EVERY);
+        // `interval_at` so the first tick lands a whole period in — a permit
+        // granted immediately (the normal case) must not log anything. Capped
+        // by the budget so a short wait still reports before it expires.
+        let every = (max_wait / 4).clamp(Duration::from_millis(1), QUEUED_WARN_EVERY);
+        let mut ticker = tokio::time::interval_at(started + every, every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let permit = loop {
             tokio::select! {
@@ -247,10 +245,9 @@ impl CliGate {
 
     /// Hand back slots whose holder is never coming (#954). A permit held
     /// past [`STALE_HOLD_FACTOR`]× the budget its caller promised cannot have
-    /// a live child behind it, and without this the leak narrows the gate for
-    /// the life of the process — on 2026-09-04 all four slots went that way.
-    /// The holder's eventual `Drop` forgets its semaphore permit rather than
-    /// returning it, so the total never exceeds `capacity`.
+    /// a live child behind it, and the leak must not narrow the gate for the
+    /// life of the process. The holder's `Drop` then forgets its permit
+    /// rather than returning it, so the total never exceeds `capacity`.
     fn reclaim_stale(&self) {
         let stale: Vec<(String, u64)> = {
             let mut held = self.held();
@@ -456,11 +453,13 @@ mod tests {
     /// never drop them, so every reasoner call in the daemon queues behind
     /// them. Before this the queue was unbounded and silent — 15 h with no
     /// email triage, no auto-PR loop and no log line. Now the wait is bounded,
-    /// the holder is nameable, and the leaked slots come back.
-    #[tokio::test(start_paused = true)]
+    /// the holder is nameable, and the leaked slots come back. Real clock at
+    /// millisecond scale: tokio's paused clock needs the `test-util` feature,
+    /// which forks the whole tokio-dependent build graph in two.
+    #[tokio::test]
     async fn leaked_permits_are_reported_reclaimed_and_never_freeze_the_gate() {
         let gate = Arc::new(CliGate::new(DEFAULT_MAX_INFLIGHT));
-        let budget = Duration::from_secs(900);
+        let budget = Duration::from_millis(500);
         let mut leaked = Vec::new();
         for _ in 0..DEFAULT_MAX_INFLIGHT {
             leaked.push(gate.acquire_timed("claude", budget).await.unwrap());
@@ -472,18 +471,17 @@ mod tests {
             panic!("every slot is held; nothing can be granted");
         };
         assert_eq!(err.provider, "claude");
-        assert!(err.waited_secs >= 900, "waited {}s", err.waited_secs);
         assert_eq!(gate.waiting(), 0, "timed-out waiter must not stay counted");
-        // Warned once a minute although `waiting()` never exceeded capacity —
+        // Warned repeatedly although `waiting()` never exceeded capacity —
         // exactly the case the saturation warning cannot see.
-        assert!(gate.queued_warns() >= 14, "{}", gate.queued_warns());
+        assert!(gate.queued_warns() >= 2, "{}", gate.queued_warns());
         let (holder, age) = gate.oldest_held().expect("four permits are held");
         assert_eq!(holder, "claude");
         assert!(age >= budget, "oldest permit age {age:?}");
 
         // Past the hold budget the slots are reclaimed, so the leak does not
         // cost capacity for the life of the process.
-        tokio::time::advance(Duration::from_secs(1_000)).await;
+        tokio::time::sleep(budget * STALE_HOLD_FACTOR).await;
         let permit = gate
             .acquire_timed("claude", budget)
             .await

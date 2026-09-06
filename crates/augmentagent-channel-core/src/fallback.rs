@@ -354,9 +354,8 @@ impl FallbackReasoner {
                     Some(ReasonerError::Local { .. } | ReasonerError::GateTimeout { .. }) => {
                         // Our fault, not the provider's — a bad local config
                         // or (#954) a jammed CLI gate. Eligible to try the
-                        // next provider, which may not even be gated
-                        // (cerebras is HTTP), but never latched: a fixed
-                        // config should work on the very next call.
+                        // next provider (cerebras is HTTP and ungated), but
+                        // never latched: a fix should work on the next call.
                         warn!(provider = name, "local fault ({err}); trying next");
                         if last_err.is_none() {
                             last_err = Some(err);

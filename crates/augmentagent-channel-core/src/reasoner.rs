@@ -3492,13 +3492,17 @@ sleep 5
     /// #954 — a permit nobody releases must fail the call, not freeze it.
     /// The typed error is ours, not the provider's, so it latches nothing and
     /// the chain is free to try the next (ungated) provider.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
         let gate = Arc::new(CliGate::new(1));
         // A hold budget far past this call's own, so the hold watchdog cannot
         // reclaim the slot first — this test is about the wait, not the leak.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", day).await.expect("gate is free");
+        // The call's watchdog budget is also its gate-wait budget, so pinning
+        // it short keeps this to a second of real time.
+        let _env = TIMEOUT_ENV_LOCK.lock().await;
+        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin: "fake-claude-never-spawned".into(),
             gate: Arc::clone(&gate),
@@ -3508,6 +3512,7 @@ sleep 5
             .call(&dummy_opts(), "hi")
             .await
             .expect_err("the only permit is held; the call cannot proceed");
+        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         let Some(typed @ ReasonerError::GateTimeout { provider, .. }) = ReasonerError::find_in(&err)
         else {
             panic!("expected GateTimeout, got {err:?}");
