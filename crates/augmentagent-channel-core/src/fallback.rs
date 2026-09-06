@@ -351,25 +351,13 @@ impl FallbackReasoner {
                         }
                         continue;
                     }
-                    Some(ReasonerError::GateTimeout { waited_secs, .. }) => {
-                        // #954 — our CLI gate is jammed, which says nothing
-                        // about this provider: never latched, and the next
-                        // one in the chain may not even be gated (cerebras
-                        // is HTTP).
-                        warn!(
-                            provider = name,
-                            waited_secs, "CLI gate never granted a permit; trying next"
-                        );
-                        if last_err.is_none() {
-                            last_err = Some(err);
-                        }
-                        continue;
-                    }
-                    Some(ReasonerError::Local { message }) => {
-                        // Local fault: eligible to try the next provider, but
-                        // never latched — a fixed config should work on the
-                        // very next call.
-                        warn!(provider = name, "provider local fault ({message}); trying next");
+                    Some(ReasonerError::Local { .. } | ReasonerError::GateTimeout { .. }) => {
+                        // Our fault, not the provider's — a bad local config
+                        // or (#954) a jammed CLI gate. Eligible to try the
+                        // next provider, which may not even be gated
+                        // (cerebras is HTTP), but never latched: a fixed
+                        // config should work on the very next call.
+                        warn!(provider = name, "local fault ({err}); trying next");
                         if last_err.is_none() {
                             last_err = Some(err);
                         }

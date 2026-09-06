@@ -101,18 +101,11 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
-        // #898 — CLI slot taken before the watchdog starts (see cli_gate);
-        // #954 — bounded by the same budget, so a leaked permit fails the
-        // call over to the next provider instead of parking it forever.
-        let _permit = match self.gate.acquire_timed("codex", dur).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(anyhow::Error::new(ReasonerError::GateTimeout {
-                    provider: provider.into(),
-                    waited_secs: e.waited_secs,
-                }))
-            }
-        };
+        // #898 — CLI slot taken before the watchdog starts (see cli_gate), and
+        // #954 — bounded by the same budget, so a jammed gate fails over.
+        let _permit = self.gate.acquire_timed("codex", dur).await.map_err(|e| {
+            ReasonerError::GateTimeout { provider: provider.into(), waited_secs: e.waited_secs }
+        })?;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error

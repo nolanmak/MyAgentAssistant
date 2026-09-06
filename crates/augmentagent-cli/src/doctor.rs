@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use augmentagent_channel_core::cli_gate;
 use augmentagent_channel_core::providers::{model_for, parse_chain, ModelTier, ProviderKind};
 use augmentagent_store::{rusqlite, Store};
 
@@ -176,6 +177,8 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_calendar_scheduled(&store));
     // 13. reasoner chain — configured providers + the model each tier runs (#658)
     findings.push(check_reasoner_chain());
+    // 14. reasoner CLI gate — is the daemon's #898 gate wedged? (#954)
+    findings.push(check_reasoner_gate());
 
     // --- Deep checks (off by default).
     if deep {
@@ -739,6 +742,50 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
     }
 }
 
+/// #954 — the #898 CLI gate is process-global inside the daemon, so doctor
+/// reads the snapshot the daemon leaves behind. A permit held far past the
+/// longest legitimate call is the 2026-09-04 freeze: every channel queues
+/// behind it and nothing else in the box says so.
+fn check_reasoner_gate() -> Finding {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Three watchdog budgets: past that no honest call is still running (the
+    // most generous capability class already caps at 2x).
+    let stuck_after = augmentagent_channel_core::reasoner::reasoner_timeout().as_secs() * 3;
+    gate_finding(cli_gate::read_snapshot(), now, stuck_after)
+}
+
+fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64) -> Finding {
+    let Some(s) = snap else {
+        return Finding::ok("reasoner_gate", "no reasoner CLI call yet this boot");
+    };
+    if !PathBuf::from(format!("/proc/{}", s.pid)).exists() {
+        return Finding::ok(
+            "reasoner_gate",
+            format!("stale snapshot from pid {} (no longer running)", s.pid),
+        );
+    }
+    let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
+    let (Some(provider), Some(since)) = (s.oldest_provider.as_deref(), s.oldest_since_unix) else {
+        return Finding::ok("reasoner_gate", format!("{state} (idle)"));
+    };
+    let age = now.saturating_sub(since);
+    if age >= stuck_after {
+        Finding::warn(
+            "reasoner_gate",
+            format!("{state}; oldest permit ({provider}) held {age}s — reasoning may be wedged"),
+            Some("journalctl --user -u augmentagent -g 'CLI gate' -n 50"),
+        )
+    } else {
+        Finding::ok(
+            "reasoner_gate",
+            format!("{state}; oldest permit ({provider}) held {age}s"),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `--deep` checks.
 // ---------------------------------------------------------------------------
@@ -1092,6 +1139,34 @@ mod tests {
         );
         assert_eq!(dark.severity, Severity::Warn);
         assert!(dark.message.contains("codex"), "{}", dark.message);
+    }
+
+    /// #954 — doctor must be able to say "the gate is wedged". The freeze
+    /// shape: every slot held, callers queued, oldest permit hours old.
+    #[test]
+    fn gate_finding_flags_a_wedged_gate() {
+        let now = 100_000u64;
+        // Our own pid, so the liveness probe sees a running process.
+        let wedged = |held_for: u64| cli_gate::GateSnapshot {
+            pid: std::process::id(),
+            capacity: 4,
+            in_flight: 4,
+            waiting: 7,
+            oldest_provider: Some("claude".to_string()),
+            oldest_since_unix: Some(now - held_for),
+            updated_unix: now - held_for,
+        };
+
+        let stuck = gate_finding(Some(wedged(54_000)), now, 10_800);
+        assert_eq!(stuck.severity, Severity::Warn);
+        for want in ["in_flight 4/4", "waiting 7", "claude", "54000s"] {
+            assert!(stuck.message.contains(want), "{want}: {}", stuck.message);
+        }
+        // A busy gate, a dead daemon and a fresh box are all fine.
+        let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
+        for ok in [Some(wedged(120)), Some(dead), None] {
+            assert_eq!(gate_finding(ok, now, 10_800).severity, Severity::Ok);
+        }
     }
 
     #[test]

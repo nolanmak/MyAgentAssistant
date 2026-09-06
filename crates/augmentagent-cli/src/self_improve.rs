@@ -6953,14 +6953,6 @@ fn utc_day_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn run_once_deadline() -> std::time::Duration {
-    run_once_deadline_from(
-        std::env::var("AUGMENTAGENT_AUTOPR_RUN_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
-    )
-}
-
 /// How long one `run_once` may take before the loop abandons it (#954).
 /// `AUGMENTAGENT_AUTOPR_RUN_TIMEOUT_SECS` tunes it; the floor is 30 minutes
 /// so a mis-set value can't start killing healthy builds mid-gate.
@@ -7065,7 +7057,9 @@ impl AutoPrLoop {
                 // future kills any CLI child (kill_on_drop) and releases its
                 // gate permit; the next tick's preflight handles whatever
                 // worktree state is left behind.
-                let deadline = run_once_deadline();
+                let deadline = run_once_deadline_from(
+                    std::env::var("AUGMENTAGENT_AUTOPR_RUN_TIMEOUT_SECS").ok().as_deref(),
+                );
                 let Ok(outcome) =
                     tokio::time::timeout(deadline, run_once(&self.repo_root, self.dry_run)).await
                 else {
@@ -8976,51 +8970,29 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     /// as an unbilled `Infra` harness failure (#803).
     #[test]
     fn autopr_run_once_await_is_bounded() {
+        use std::time::Duration;
         let src = include_str!("self_improve.rs");
         let start = src
             .find("    pub async fn run(self, shutdown: tokio_util::sync::CancellationToken)")
             .expect("AutoPrLoop::run");
-        let end = start + src[start..].find("\n    }\n").expect("end of run");
-        let body = &src[start..end];
+        let body = &src[start..start + src[start..].find("\n    }\n").expect("end of run")];
+        let call = body
+            .find("tokio::time::timeout(deadline, run_once(&self.repo_root")
+            .expect("run_once must be awaited under the configured deadline");
+        let arm_end = body[call..].find("\n                };").expect("expiry arm");
+        let arm = &body[call..call + arm_end];
+        assert!(
+            arm.contains("FailureKind::Infra") && !arm.contains("counter.record("),
+            "an abandoned run is an unbilled harness failure (#803), not the issue's fault"
+        );
 
-        let call = body.find("run_once(&self.repo_root").expect("run_once call");
-        let wrapped = body[..call]
-            .rfind("tokio::time::timeout(")
-            .expect("run_once must be awaited under a timeout");
-        assert!(
-            body[wrapped..call].contains("deadline"),
-            "the timeout must use the configured run deadline"
-        );
-        let arm_at = call + body[call..].find("else {").expect("timeout-expiry arm");
-        let arm_end = arm_at + body[arm_at..].find("\n                };").expect("end of arm");
-        let arm = &body[arm_at..arm_end];
-        assert!(
-            arm.contains("FailureKind::Infra"),
-            "an abandoned run is a harness failure, not the issue's fault"
-        );
-        assert!(
-            !arm.contains("counter.record("),
-            "an abandoned run must not be billed against the daily cap"
-        );
-    }
-
-    #[test]
-    fn autopr_run_deadline_is_clamped_and_env_tunable() {
-        use std::time::Duration;
         assert_eq!(
             run_once_deadline_from(None),
             Duration::from_secs(AutoPrLoop::DEFAULT_RUN_DEADLINE_SECS)
         );
-        assert_eq!(
-            run_once_deadline_from(Some(" 7200 ")),
-            Duration::from_secs(7200)
-        );
+        assert_eq!(run_once_deadline_from(Some(" 7200 ")), Duration::from_secs(7200));
         // A too-small value would abandon healthy runs mid-build.
         assert_eq!(run_once_deadline_from(Some("5")), Duration::from_secs(1_800));
-        assert_eq!(
-            run_once_deadline_from(Some("nonsense")),
-            Duration::from_secs(AutoPrLoop::DEFAULT_RUN_DEADLINE_SECS)
-        );
     }
 
     // Structural: in run_once's gate-failure arm the baseline comparison

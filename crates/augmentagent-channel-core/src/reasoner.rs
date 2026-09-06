@@ -695,14 +695,9 @@ impl ClaudeCliReasoner {
         // every path, including the watchdog dropping `call_once`.
         // #954 — the *wait* carries the same budget as the call: an
         // unbounded queue is how the whole daemon stopped reasoning for 15 h.
-        let _permit = match self.gate.acquire_timed("claude", dur).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(CallError::GateTimeout {
-                    waited_secs: e.waited_secs,
-                })
-            }
-        };
+        let _permit = self.gate.acquire_timed("claude", dur).await.map_err(|e| {
+            CallError::GateTimeout { waited_secs: e.waited_secs }
+        })?;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
             Ok(r) => r,
             Err(_) => {
@@ -3303,10 +3298,9 @@ mod ask_mode_social_card_allowlist_tests {
 mod failover_error_tests {
     use super::*;
 
-    /// `AUGMENTAGENT_REASONER_TIMEOUT_SECS` is process-global, and since #954
-    /// it also bounds how long a call waits for a gate permit — a test that
-    /// shortens it must not run while another is queueing calls through a
-    /// gate, or the queued ones die on a budget they never asked for.
+    /// Since #954 `AUGMENTAGENT_REASONER_TIMEOUT_SECS` also bounds gate
+    /// waits, so a test that shortens it must not run alongside one that
+    /// queues calls through a gate.
     static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn dummy_opts() -> ReasonerOpts {
@@ -3501,7 +3495,10 @@ sleep 5
     #[tokio::test(start_paused = true)]
     async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
         let gate = Arc::new(CliGate::new(1));
-        let leaked = gate.acquire("claude").await;
+        // A hold budget far past this call's own, so the hold watchdog cannot
+        // reclaim the slot first — this test is about the wait, not the leak.
+        let day = std::time::Duration::from_secs(86_400);
+        let leaked = gate.acquire_timed("claude", day).await.expect("gate is free");
         let reasoner = ClaudeCliReasoner {
             bin: "fake-claude-never-spawned".into(),
             gate: Arc::clone(&gate),
@@ -3511,16 +3508,15 @@ sleep 5
             .call(&dummy_opts(), "hi")
             .await
             .expect_err("the only permit is held; the call cannot proceed");
-        match ReasonerError::find_in(&err) {
-            Some(typed @ ReasonerError::GateTimeout { provider, .. }) => {
-                assert_eq!(provider, "claude");
-                assert!(
-                    !typed.is_provider_side(),
-                    "our own gate must never latch a provider cooldown"
-                );
-            }
-            other => panic!("expected GateTimeout, got {other:?}"),
-        }
+        let Some(typed @ ReasonerError::GateTimeout { provider, .. }) = ReasonerError::find_in(&err)
+        else {
+            panic!("expected GateTimeout, got {err:?}");
+        };
+        assert_eq!(provider, "claude");
+        assert!(
+            !typed.is_provider_side(),
+            "our own gate must never latch a provider cooldown"
+        );
         assert_eq!(gate.waiting(), 0);
         drop(leaked);
         assert_eq!(gate.in_flight(), 0);
