@@ -46,7 +46,7 @@ use tokio::process::Command;
 use tracing::warn;
 
 use crate::providers::{classify, model_for, tier_of, CapabilityClass, ProviderKind};
-use crate::reasoner::{reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts};
+use crate::reasoner::{caller_tag, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts};
 
 /// Gemini binary override (`GEMINI_CLI`, mirroring `CLAUDE_CLI`) — also the
 /// fault-injection rig's hook (#666).
@@ -82,9 +82,9 @@ impl GeminiCliReasoner {
         let dur = reasoner_timeout();
         // #898 — CLI slot taken before the watchdog starts (see cli_gate), and
         // #954 — bounded by the same budget, so a jammed gate fails over.
-        let _permit = self.gate.acquire_timed("gemini", dur).await.map_err(|e| {
-            ReasonerError::GateTimeout { provider: "gemini".into(), waited_secs: e.waited_secs }
-        })?;
+        let caller = caller_tag(opts);
+        let acquire = self.gate.acquire_timed("gemini", &caller, dur);
+        let _permit = acquire.await.map_err(ReasonerError::from)?;
         match tokio::time::timeout(dur, self.call_once(opts, user_message)).await {
             // Post-classify untyped failures (stdin EPIPE, read/wait IO) as
             // provider-side Unavailable (#655 review) so they fail over
