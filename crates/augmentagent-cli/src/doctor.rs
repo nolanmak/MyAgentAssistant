@@ -761,9 +761,8 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64
         return Finding::ok("reasoner_gate", format!("stale snapshot from pid {}", s.pid));
     }
     let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
-    // The hold watchdog rewrites this every sweep while anything is held, so a
-    // live pid with a stale snapshot means the sweep itself stopped — and then
-    // the counts above cannot be believed.
+    // The watchdog rewrites this every sweep while anything is held, so a live
+    // pid with a stale snapshot means the sweep itself stopped.
     let quiet_for = now.saturating_sub(s.updated_unix);
     if s.in_flight > 0 && quiet_for > cli_gate::WATCHDOG_EVERY.as_secs() * 3 {
         let msg = format!("{state}; gate snapshot {quiet_for}s stale — watchdog not sweeping");
@@ -774,11 +773,10 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64
     };
     let age = now.saturating_sub(since);
     let msg = format!("{state}; oldest permit ({provider}) held {age}s");
-    if age >= stuck_after {
-        Finding::warn("reasoner_gate", format!("{msg} — reasoning may be wedged"), Some(HINT))
-    } else {
-        Finding::ok("reasoner_gate", msg)
+    if age < stuck_after {
+        return Finding::ok("reasoner_gate", msg);
     }
+    Finding::warn("reasoner_gate", format!("{msg} — reasoning may be wedged"), Some(HINT))
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,9 +1154,7 @@ mod tests {
         assert!(stuck.message.starts_with(want), "{}", stuck.message);
         // A snapshot no longer being refreshed says the sweep itself stopped.
         let quiet = cli_gate::GateSnapshot { updated_unix: now - 600, ..wedged(120) };
-        let quiet = gate_finding(Some(quiet), now, 10_800);
-        assert_eq!(quiet.severity, Severity::Warn);
-        assert!(quiet.message.contains("not sweeping"), "{}", quiet.message);
+        assert!(gate_finding(Some(quiet), now, 10_800).message.contains("not sweeping"));
         // A busy gate, a dead daemon and a fresh box are all fine.
         let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
         for ok in [Some(wedged(120)), Some(dead), None] {

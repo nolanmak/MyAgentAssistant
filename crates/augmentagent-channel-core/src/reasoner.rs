@@ -709,11 +709,19 @@ impl ClaudeCliReasoner {
         // unbounded queue is how the whole daemon stopped reasoning for 15 h.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
-        let _permit =
+        let permit =
             acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
+        let call = tokio::time::timeout(dur, self.call_once(opts, user_message, capture));
+        // A revoked permit ends the call the same way the watchdog does: the
+        // future is dropped, the child dies with it, and the slot comes back
+        // through the permit's own Drop — never widening the gate (#954).
+        let outcome = tokio::select! {
+            r = call => r.map_err(|_| ()),
+            _ = permit.revoked() => Err(()),
+        };
+        match outcome {
             Ok(r) => r,
-            Err(_) => {
+            Err(()) => {
                 warn!(
                     "claude call exceeded the {}s watchdog; child killed (see \
                      AUGMENTAGENT_REASONER_TIMEOUT_SECS, #656)",
@@ -3505,7 +3513,7 @@ sleep 5
     #[tokio::test]
     async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
         let gate = Arc::new(CliGate::new(1));
-        // Held far past this call's budget, so the watchdog cannot reclaim it.
+        // Held far past this call's budget, so revocation cannot free it here.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
         // The call's watchdog budget is also its gate-wait budget.
@@ -3513,11 +3521,7 @@ sleep 5
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let bin = "fake-claude-never-spawned".into();
         let reasoner = ClaudeCliReasoner { bin, gate: Arc::clone(&gate) };
-
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
-            .await
-            .expect_err("the only permit is held; the call cannot proceed");
+        let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("the permit is held");
         std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         let Some(typed @ ReasonerError::GateTimeout { provider, .. }) = ReasonerError::find_in(&err)
         else {
