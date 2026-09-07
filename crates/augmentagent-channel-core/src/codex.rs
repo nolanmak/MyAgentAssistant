@@ -106,8 +106,7 @@ impl CodexCliReasoner {
         let acquire = self.gate.acquire_timed("codex", &caller, dur);
         let permit = acquire.await.map_err(ReasonerError::from)?;
         let call = tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks));
-        // #954 — a revoked permit ends the call like the watchdog does: the
-        // child dies with the dropped future, and only Drop frees the slot.
+        // A revoked permit ends the call like the watchdog does (#954).
         let outcome = tokio::select! {
             r = call => r.map_err(|_| ()),
             _ = permit.revoked() => Err(()),

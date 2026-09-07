@@ -742,17 +742,14 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
     }
 }
 
-/// #954 — the #898 CLI gate lives inside the daemon, so doctor reads the
-/// snapshot it leaves behind: a permit held far past the longest legitimate
-/// call, or a snapshot no longer refreshed, is the 2026-09-04 freeze.
+/// #954 — the #898 gate lives in the daemon, so doctor reads its snapshot: a
+/// permit past its promised timeout, or a stale snapshot, is the freeze.
 fn check_reasoner_gate() -> Finding {
-    let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
-    // Three watchdog budgets: past that no honest call is still running.
-    let stuck_after = augmentagent_channel_core::reasoner::reasoner_timeout().as_secs() * 3;
-    gate_finding(cli_gate::read_snapshot(), elapsed.map_or(0, |d| d.as_secs()), stuck_after)
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+    gate_finding(cli_gate::read_snapshot(), now.map_or(0, |d| d.as_secs()))
 }
 
-fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64) -> Finding {
+fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
     const HINT: &str = "journalctl --user -u augmentagent -g 'CLI gate' -n 50";
     let Some(s) = snap else {
         return Finding::ok("reasoner_gate", "no reasoner CLI call yet this boot");
@@ -761,22 +758,25 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64
         return Finding::ok("reasoner_gate", format!("stale snapshot from pid {}", s.pid));
     }
     let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
-    // The watchdog rewrites this every sweep while anything is held, so a live
-    // pid with a stale snapshot means the sweep itself stopped.
+    // Rewritten every sweep while held: stale under a live pid = no sweeping.
     let quiet_for = now.saturating_sub(s.updated_unix);
     if s.in_flight > 0 && quiet_for > cli_gate::WATCHDOG_EVERY.as_secs() * 3 {
         let msg = format!("{state}; gate snapshot {quiet_for}s stale — watchdog not sweeping");
         return Finding::warn("reasoner_gate", msg, Some(HINT));
     }
-    let (Some(provider), Some(since)) = (s.oldest_provider.as_deref(), s.oldest_since_unix) else {
+    // The permit carries its own class-aware budget (#655), so "overdue" is one
+    // timeout — the same threshold the daemon's own watchdog reports at (#954).
+    let (Some(provider), Some(since), Some(budget), Some(caller)) =
+        (s.oldest_provider, s.oldest_since_unix, s.oldest_budget_secs, s.oldest_caller)
+    else {
         return Finding::ok("reasoner_gate", format!("{state} (idle)"));
     };
     let age = now.saturating_sub(since);
-    let msg = format!("{state}; oldest permit ({provider}) held {age}s");
-    if age < stuck_after {
+    let msg = format!("{state}; oldest permit ({provider}, {caller}) held {age}s of {budget}s");
+    if age <= budget {
         return Finding::ok("reasoner_gate", msg);
     }
-    Finding::warn("reasoner_gate", format!("{msg} — reasoning may be wedged"), Some(HINT))
+    Finding::warn("reasoner_gate", format!("{msg} — reasoning is wedged"), Some(HINT))
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,10 +1134,9 @@ mod tests {
         assert!(dark.message.contains("codex"), "{}", dark.message);
     }
 
-    /// #954 — doctor must be able to say "the gate is wedged": every slot
-    /// held, callers queued, oldest permit hours old, under a live pid.
+    /// #954 — name the wedge one timeout in, with the holder's caller preset.
     #[test]
-    fn gate_finding_flags_a_wedged_gate() {
+    fn gate_finding_flags_a_permit_past_its_budget() {
         let now = 100_000u64;
         let wedged = |held_for: u64| cli_gate::GateSnapshot {
             pid: std::process::id(),
@@ -1145,20 +1144,23 @@ mod tests {
             in_flight: 4,
             waiting: 7,
             oldest_provider: Some("claude".to_string()),
+            oldest_caller: Some("TextOnly:triage-42".to_string()),
             oldest_since_unix: Some(now - held_for),
+            oldest_budget_secs: Some(900),
             updated_unix: now, // the watchdog sweeps; it is the holds that stick
         };
-        let stuck = gate_finding(Some(wedged(54_000)), now, 10_800);
+        // One second past its own budget is already the report #954 wanted.
+        let stuck = gate_finding(Some(wedged(901)), now);
         assert_eq!(stuck.severity, Severity::Warn);
-        let want = "in_flight 4/4, waiting 7; oldest permit (claude) held 54000s";
+        let want = "in_flight 4/4, waiting 7; oldest permit (claude, TextOnly:triage-42) held 901s";
         assert!(stuck.message.starts_with(want), "{}", stuck.message);
         // A snapshot no longer being refreshed says the sweep itself stopped.
         let quiet = cli_gate::GateSnapshot { updated_unix: now - 600, ..wedged(120) };
-        assert!(gate_finding(Some(quiet), now, 10_800).message.contains("not sweeping"));
-        // A busy gate, a dead daemon and a fresh box are all fine.
+        assert!(gate_finding(Some(quiet), now).message.contains("not sweeping"));
+        // Inside budget, a dead daemon and a fresh box are all fine.
         let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
-        for ok in [Some(wedged(120)), Some(dead), None] {
-            assert_eq!(gate_finding(ok, now, 10_800).severity, Severity::Ok);
+        for ok in [Some(wedged(900)), Some(dead), None] {
+            assert_eq!(gate_finding(ok, now).severity, Severity::Ok);
         }
     }
 

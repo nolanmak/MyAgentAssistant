@@ -265,9 +265,8 @@ pub enum ReasonerError {
     /// adapter says nothing about the others.
     #[error("{message}")]
     Local { message: String },
-    /// #954 — the caller gave up waiting for a #898 CLI-gate permit: our box
-    /// is saturated (or a permit leaked), which says nothing about the
-    /// provider. Never latched; the chain may still try the next one.
+    /// #954 — the caller gave up waiting for a #898 CLI-gate permit: our box,
+    /// not the provider. Never latched; the chain may still try the next.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
 }
@@ -309,8 +308,8 @@ pub fn reasoner_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Names the preset behind a CLI-gate permit for the #954 watchdog: "claude"
-/// alone cannot say *which* call leaked. The #655 class tells presets apart.
+/// Names the preset behind a CLI-gate permit (#954): "claude" alone cannot say
+/// *which* call leaked, and the #655 class tells presets apart.
 pub(crate) fn caller_tag(opts: &ReasonerOpts) -> String {
     let class = format!("{:?}", crate::providers::classify(opts));
     match opts.session_id.as_deref() {
@@ -636,10 +635,9 @@ impl ClaudeCliReasoner {
                 provider: "claude".into(),
                 secs,
             })),
-            Err(CallError::GateTimeout { waited_secs }) => {
-                let provider = "claude".into();
-                Err(anyhow::Error::new(ReasonerError::GateTimeout { provider, waited_secs }))
-            }
+            Err(CallError::GateTimeout { waited_secs }) => Err(anyhow::Error::new(
+                ReasonerError::GateTimeout { provider: "claude".into(), waited_secs },
+            )),
             // Untyped on purpose — content-level, neither latches nor fails
             // over (#655 review).
             Err(CallError::EmptyOutput) => {
@@ -674,8 +672,7 @@ impl ClaudeCliReasoner {
                         }
                         Err(CallError::GateTimeout { waited_secs }) => {
                             let provider = "claude".into();
-                            let e = ReasonerError::GateTimeout { provider, waited_secs };
-                            return Err(anyhow::Error::new(e));
+                            return Err(ReasonerError::GateTimeout { provider, waited_secs }.into());
                         }
                         Err(CallError::EmptyOutput) => {
                             return Err(anyhow::anyhow!("claude produced no assistant text"));
@@ -703,18 +700,16 @@ impl ClaudeCliReasoner {
         let dur = reasoner_timeout_for(opts);
         // #898 — take the CLI slot *before* the watchdog starts: time spent
         // queued behind other children must not count against this call.
-        // The permit lives to the end of this scope — past the child on
-        // every path, including the watchdog dropping `call_once`.
-        // #954 — the *wait* carries the same budget as the call: an
-        // unbounded queue is how the whole daemon stopped reasoning for 15 h.
+        // The permit lives to the end of this scope — past the child on every
+        // path, including the watchdog dropping `call_once`. #954 — the *wait*
+        // carries the same budget: unbounded, it froze the daemon for 15 h.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
         let permit =
             acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
         let call = tokio::time::timeout(dur, self.call_once(opts, user_message, capture));
-        // A revoked permit ends the call the same way the watchdog does: the
-        // future is dropped, the child dies with it, and the slot comes back
-        // through the permit's own Drop — never widening the gate (#954).
+        // A revoked permit ends the call the way the watchdog does: the future
+        // is dropped, the child dies with it, and only Drop frees the slot.
         let outcome = tokio::select! {
             r = call => r.map_err(|_| ()),
             _ = permit.revoked() => Err(()),
@@ -3508,25 +3503,21 @@ sleep 5
         assert_eq!(out, "ok");
     }
 
-    /// #954 — a permit nobody releases must fail the call, not freeze it. The
-    /// typed error is ours, not the provider's, so it latches nothing.
+    /// #954 — a permit nobody releases must fail the call, not freeze it, and
+    /// the typed error must be ours, not the provider's, so it latches nothing.
     #[tokio::test]
     async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
         let gate = Arc::new(CliGate::new(1));
-        // Held far past this call's budget, so revocation cannot free it here.
+        // A day's budget, so only the caller's own 1 s watchdog bounds the wait.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
-        // The call's watchdog budget is also its gate-wait budget.
         let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
-        let bin = "fake-claude-never-spawned".into();
-        let reasoner = ClaudeCliReasoner { bin, gate: Arc::clone(&gate) };
+        let reasoner = ClaudeCliReasoner { bin: "never-spawned".into(), gate: Arc::clone(&gate) };
         let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("the permit is held");
         std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
-        let Some(typed @ ReasonerError::GateTimeout { provider, .. }) = ReasonerError::find_in(&err)
-        else {
-            panic!("expected GateTimeout, got {err:?}");
-        };
+        let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
+        let ReasonerError::GateTimeout { provider, .. } = typed else { panic!("{typed:?}") };
         assert_eq!(provider, "claude");
         assert!(!typed.is_provider_side(), "our gate is not a provider fault");
         drop(leaked);
