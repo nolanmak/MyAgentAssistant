@@ -7037,7 +7037,18 @@ impl AutoPrLoop {
             // refusal, so this burst is self-limiting.
             let mut triaged = 0u32;
             loop {
-                match run_once(&self.repo_root, self.dry_run).await {
+                // #954 — not time-boxed (a builder legitimately compiles for
+                // tens of minutes; each reasoner call inside is bounded now) but
+                // cancellable: the 15 h freeze swallowed shutdown too.
+                let outcome = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        info!("auto-PR loop stopped mid-tick");
+                        return Ok(());
+                    }
+                    r = run_once(&self.repo_root, self.dry_run) => r,
+                };
+                match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         counter.record(today);
@@ -10401,6 +10412,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let body = &src[start..start + 4000];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
         assert!(body.contains("counter.record(today);"));
+        // #954 — the tick's own await races shutdown, so a wedged reasoner
+        // cannot make the loop unstoppable the way it was for 15 h.
+        assert!(body.contains("r = run_once(&self.repo_root, self.dry_run) => r,"), "tick select");
+        assert_eq!(body.matches("_ = shutdown.cancelled()").count(), 2, "sleep AND tick race it");
     }
 
     // Structural (codex on #859): a revision-round failure is recorded with

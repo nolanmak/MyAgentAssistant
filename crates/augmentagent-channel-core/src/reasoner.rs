@@ -265,6 +265,16 @@ pub enum ReasonerError {
     /// adapter says nothing about the others.
     #[error("{message}")]
     Local { message: String },
+    /// #954 — the caller gave up waiting for a #898 CLI-gate permit: our box,
+    /// not the provider. Never latched; the chain may still try the next.
+    #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
+    GateTimeout { provider: String, waited_secs: u64 },
+}
+
+impl From<crate::cli_gate::GateWaitTimeout> for ReasonerError {
+    fn from(e: crate::cli_gate::GateWaitTimeout) -> Self {
+        ReasonerError::GateTimeout { provider: e.provider, waited_secs: e.waited_secs }
+    }
 }
 
 impl ReasonerError {
@@ -296,6 +306,16 @@ pub fn reasoner_timeout() -> std::time::Duration {
         .filter(|s| *s > 0)
         .unwrap_or(3600);
     std::time::Duration::from_secs(secs)
+}
+
+/// Names the preset behind a CLI-gate permit (#954): "claude" alone cannot say
+/// *which* call leaked, and the #655 class tells presets apart.
+pub(crate) fn caller_tag(opts: &ReasonerOpts) -> String {
+    let class = format!("{:?}", crate::providers::classify(opts));
+    match opts.session_id.as_deref() {
+        Some(sid) => format!("{class}:{sid}"),
+        None => class,
+    }
 }
 
 /// Class-aware watchdog (#655 review): full-agentic and write-tools runs
@@ -615,6 +635,9 @@ impl ClaudeCliReasoner {
                 provider: "claude".into(),
                 secs,
             })),
+            Err(CallError::GateTimeout { waited_secs }) => Err(anyhow::Error::new(
+                ReasonerError::GateTimeout { provider: "claude".into(), waited_secs },
+            )),
             // Untyped on purpose — content-level, neither latches nor fails
             // over (#655 review).
             Err(CallError::EmptyOutput) => {
@@ -647,6 +670,10 @@ impl ClaudeCliReasoner {
                                 secs,
                             }));
                         }
+                        Err(CallError::GateTimeout { waited_secs }) => {
+                            let provider = "claude".into();
+                            return Err(ReasonerError::GateTimeout { provider, waited_secs }.into());
+                        }
                         Err(CallError::EmptyOutput) => {
                             return Err(anyhow::anyhow!("claude produced no assistant text"));
                         }
@@ -673,12 +700,23 @@ impl ClaudeCliReasoner {
         let dur = reasoner_timeout_for(opts);
         // #898 — take the CLI slot *before* the watchdog starts: time spent
         // queued behind other children must not count against this call.
-        // The permit lives to the end of this scope — past the child on
-        // every path, including the watchdog dropping `call_once`.
-        let _permit = self.gate.acquire("claude").await;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
+        // The permit lives to the end of this scope — past the child on every
+        // path, including the watchdog dropping `call_once`. #954 — the *wait*
+        // carries the same budget: unbounded, it froze the daemon for 15 h.
+        let caller = caller_tag(opts);
+        let acquire = self.gate.acquire_timed("claude", &caller, dur);
+        let permit =
+            acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
+        let call = tokio::time::timeout(dur, self.call_once(opts, user_message, capture));
+        // A revoked permit ends the call the way the watchdog does: the future
+        // is dropped, the child dies with it, and only Drop frees the slot.
+        let outcome = tokio::select! {
+            r = call => r.map_err(|_| ()),
+            _ = permit.revoked() => Err(()),
+        };
+        match outcome {
             Ok(r) => r,
-            Err(_) => {
+            Err(()) => {
                 warn!(
                     "claude call exceeded the {}s watchdog; child killed (see \
                      AUGMENTAGENT_REASONER_TIMEOUT_SECS, #656)",
@@ -737,6 +775,9 @@ enum CallError {
     /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
     /// a typed, failover-eligible [`ReasonerError::Timeout`].
     Timeout { secs: u64 },
+    /// #954 — the #898 gate never handed out a permit, so no child ever ran:
+    /// our box's fault, not the provider's.
+    GateTimeout { waited_secs: u64 },
     /// The CLI exited 0 but produced no assistant text. Content-level, NOT
     /// provider-side (#655 review): surfaced untyped so it neither latches
     /// the provider nor triggers failover.
@@ -3273,6 +3314,9 @@ mod ask_mode_social_card_allowlist_tests {
 mod failover_error_tests {
     use super::*;
 
+    /// Since #954 the reasoner timeout also bounds gate waits.
+    static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
             system_prompt: "stub".into(),
@@ -3371,6 +3415,7 @@ sleep 0.15
 {RESULT_OK}
 "),
         );
+        let _env = TIMEOUT_ENV_LOCK.lock().await;
         let gate = Arc::new(CliGate::new(3));
         let reasoner = Arc::new(ClaudeCliReasoner {
             bin,
@@ -3458,6 +3503,27 @@ sleep 5
         assert_eq!(out, "ok");
     }
 
+    /// #954 — a permit nobody releases must fail the call, not freeze it, and
+    /// the typed error must be ours, not the provider's, so it latches nothing.
+    #[tokio::test]
+    async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
+        let gate = Arc::new(CliGate::new(1));
+        // A day's budget, so only the caller's own 1 s watchdog bounds the wait.
+        let day = std::time::Duration::from_secs(86_400);
+        let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
+        let _env = TIMEOUT_ENV_LOCK.lock().await;
+        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
+        let reasoner = ClaudeCliReasoner { bin: "never-spawned".into(), gate: Arc::clone(&gate) };
+        let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("the permit is held");
+        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
+        let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
+        let ReasonerError::GateTimeout { provider, .. } = typed else { panic!("{typed:?}") };
+        assert_eq!(provider, "claude");
+        assert!(!typed.is_provider_side(), "our gate is not a provider fault");
+        drop(leaked);
+        assert_eq!((gate.waiting(), gate.in_flight()), (0, 0));
+    }
+
     /// #448's refusal arrives as a SUCCESSFUL completion; post-#656 it must
     /// surface as a downcastable `ReasonerError::RateLimited` with the reset
     /// hint parsed — that's what the fallback chain latches from.
@@ -3504,6 +3570,7 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     async fn hung_cli_times_out_with_typed_error() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
+        let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin,

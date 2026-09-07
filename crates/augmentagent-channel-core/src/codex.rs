@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 
 use crate::providers::{model_for, tier_of, ProviderKind};
 use crate::reasoner::{
-    parse_reset_hint, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts,
+    caller_tag, parse_reset_hint, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts,
 };
 
 /// Codex binary override (`CODEX_CLI`, mirroring `CLAUDE_CLI`) — also how
@@ -101,9 +101,17 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
-        // #898 — CLI slot taken before the watchdog starts (see cli_gate).
-        let _permit = self.gate.acquire("codex").await;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
+        // #898 — CLI slot before the watchdog starts; #954 — bounded wait.
+        let caller = caller_tag(opts);
+        let acquire = self.gate.acquire_timed("codex", &caller, dur);
+        let permit = acquire.await.map_err(ReasonerError::from)?;
+        let call = tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks));
+        // A revoked permit ends the call like the watchdog does (#954).
+        let outcome = tokio::select! {
+            r = call => r.map_err(|_| ()),
+            _ = permit.revoked() => Err(()),
+        };
+        match outcome {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
             // would abort the whole chain instead of failing over.
