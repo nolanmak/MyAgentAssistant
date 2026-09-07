@@ -306,6 +306,20 @@ pub fn approval_message(
     }
     let embed = embed.footer(CreateEmbedFooter::new(footer));
 
+    // #927 — a merge card carries evidence, not a draft: nothing to redraft,
+    // so Approve (which runs the merge) and Skip are the only verbs offered.
+    if email.kind == "identity_merge" {
+        let row = CreateActionRow::Buttons(vec![
+            CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
+                .label("Approve & Merge")
+                .style(ButtonStyle::Success),
+            CreateButton::new(CustomId::new(action_id, Verb::Skip).to_string())
+                .label("Skip")
+                .style(ButtonStyle::Secondary),
+        ]);
+        return CreateMessage::new().embed(embed).components(vec![row]);
+    }
+
     let button_row = CreateActionRow::Buttons(vec![
         CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
             .label("Approve & Send")
@@ -935,6 +949,18 @@ mod tests {
         let fresh = json(&approval_message("act-s1", &email(), "plain draft", 0));
         assert!(fresh.contains("aa:act-s1:schedule_pick"));
         assert!(fresh.contains("quick_refine"));
+    }
+
+    /// #927 — Approve (which runs the merge) and Skip are the only verbs the
+    /// merge handler implements, so they are the only ones rendered.
+    #[test]
+    fn identity_merge_card_offers_only_approve_and_skip() {
+        let mut e = email();
+        e.kind = "identity_merge".into();
+        let v = json(&approval_message("act-m1", &e, "evidence", 0));
+        assert!(v.contains("aa:act-m1:approve") && v.contains("Approve & Merge"));
+        assert!(v.contains("aa:act-m1:skip") && !v.contains(":revise"), "nothing to redraft");
+        assert_eq!(row_count(&approval_message("a", &email(), "d", 0)), 3, "other kinds unchanged");
     }
 
     #[test]
