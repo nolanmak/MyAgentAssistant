@@ -118,16 +118,6 @@ pub struct DiscordApprovalBroker {
 }
 
 impl DiscordApprovalBroker {
-    /// The REST half of the broker, no gateway session (#927): a one-shot CLI
-    /// raises its card like every other surface, but `start` would block forever
-    /// on a `Ready` no event loop is there to receive.
-    pub fn rest_only(bot_token: &str, channel_id: u64) -> Self {
-        Self {
-            http: Arc::new(serenity::http::Http::new(bot_token)),
-            channel_id: ChannelId::new(channel_id),
-        }
-    }
-
     /// Start the serenity client in a background task. Blocks the current task
     /// until the gateway is `Ready`, after which `post_approval` calls may be
     /// issued.

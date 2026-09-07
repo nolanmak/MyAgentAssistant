@@ -3136,9 +3136,9 @@ impl Store {
     /// raised) without the user having to ask.
     ///
     /// #927 — `identity_merge` cards are excluded: all three staleness rules
-    /// read an inbound *email* (thread answered? sender a bulk mailer? draft
-    /// empty?), and a merge card has no thread and a display name rather than a
-    /// mailbox in `fromEmail`, which the bulk-sender rule retires on sight.
+    /// read an inbound *email* (thread answered? bulk sender? empty draft?),
+    /// and a merge card has no thread and a display name rather than a mailbox
+    /// in `fromEmail`, which the bulk-sender rule retires on sight.
     pub fn pending_actions_for_reconcile(&self) -> StoreResult<Vec<PendingActionRow>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
