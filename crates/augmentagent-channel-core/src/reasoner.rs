@@ -265,9 +265,9 @@ pub enum ReasonerError {
     /// adapter says nothing about the others.
     #[error("{message}")]
     Local { message: String },
-    /// #954 — the caller gave up waiting for a #898 CLI-gate permit. Our box
+    /// #954 — the caller gave up waiting for a #898 CLI-gate permit: our box
     /// is saturated (or a permit leaked), which says nothing about the
-    /// provider: never latched, but the chain may still try the next one.
+    /// provider. Never latched; the chain may still try the next one.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
 }
@@ -309,10 +309,8 @@ pub fn reasoner_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Names the preset behind a CLI-gate permit for the #954 hold watchdog:
-/// "claude" alone cannot say *which* call leaked a slot. The capability class
-/// already distinguishes presets without adding a field to every one of them
-/// (#655); the ask/draft paths carry a session id on top.
+/// Names the preset behind a CLI-gate permit for the #954 watchdog: "claude"
+/// alone cannot say *which* call leaked. The #655 class tells presets apart.
 pub(crate) fn caller_tag(opts: &ReasonerOpts) -> String {
     let class = format!("{:?}", crate::providers::classify(opts));
     match opts.session_id.as_deref() {
@@ -639,10 +637,8 @@ impl ClaudeCliReasoner {
                 secs,
             })),
             Err(CallError::GateTimeout { waited_secs }) => {
-                Err(anyhow::Error::new(ReasonerError::GateTimeout {
-                    provider: "claude".into(),
-                    waited_secs,
-                }))
+                let provider = "claude".into();
+                Err(anyhow::Error::new(ReasonerError::GateTimeout { provider, waited_secs }))
             }
             // Untyped on purpose — content-level, neither latches nor fails
             // over (#655 review).
@@ -677,10 +673,9 @@ impl ClaudeCliReasoner {
                             }));
                         }
                         Err(CallError::GateTimeout { waited_secs }) => {
-                            return Err(anyhow::Error::new(ReasonerError::GateTimeout {
-                                provider: "claude".into(),
-                                waited_secs,
-                            }));
+                            let provider = "claude".into();
+                            let e = ReasonerError::GateTimeout { provider, waited_secs };
+                            return Err(anyhow::Error::new(e));
                         }
                         Err(CallError::EmptyOutput) => {
                             return Err(anyhow::anyhow!("claude produced no assistant text"));
@@ -714,9 +709,8 @@ impl ClaudeCliReasoner {
         // unbounded queue is how the whole daemon stopped reasoning for 15 h.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
-        let _permit = acquire
-            .await
-            .map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
+        let _permit =
+            acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
             Ok(r) => r,
             Err(_) => {
@@ -3317,8 +3311,7 @@ mod ask_mode_social_card_allowlist_tests {
 mod failover_error_tests {
     use super::*;
 
-    /// Since #954 `AUGMENTAGENT_REASONER_TIMEOUT_SECS` also bounds gate waits,
-    /// so a test that shortens it must not run beside one that queues.
+    /// Since #954 the reasoner timeout also bounds gate waits.
     static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn dummy_opts() -> ReasonerOpts {
@@ -3512,12 +3505,10 @@ sleep 5
     #[tokio::test]
     async fn gate_wait_expiry_surfaces_a_typed_gate_timeout() {
         let gate = Arc::new(CliGate::new(1));
-        // A hold budget far past this call's own, so the hold watchdog cannot
-        // reclaim the slot first — this test is about the wait, not the leak.
+        // Held far past this call's budget, so the watchdog cannot reclaim it.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
-        // The call's watchdog budget is also its gate-wait budget, so pinning
-        // it short keeps this to a second of real time.
+        // The call's watchdog budget is also its gate-wait budget.
         let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let bin = "fake-claude-never-spawned".into();
@@ -3534,9 +3525,8 @@ sleep 5
         };
         assert_eq!(provider, "claude");
         assert!(!typed.is_provider_side(), "our gate is not a provider fault");
-        assert_eq!(gate.waiting(), 0);
         drop(leaked);
-        assert_eq!(gate.in_flight(), 0);
+        assert_eq!((gate.waiting(), gate.in_flight()), (0, 0));
     }
 
     /// #448's refusal arrives as a SUCCESSFUL completion; post-#656 it must

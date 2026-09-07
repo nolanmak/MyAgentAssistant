@@ -6953,23 +6953,14 @@ fn utc_day_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// How long one `run_once` may take before the loop abandons it (#954).
-/// `AUGMENTAGENT_AUTOPR_RUN_TIMEOUT_SECS` tunes it; the floor is 30 minutes so
-/// a mis-set value can't start killing healthy builds mid-gate.
-fn run_once_deadline_from(raw: Option<&str>) -> std::time::Duration {
-    let parsed = raw.and_then(|v| v.trim().parse::<u64>().ok());
-    let secs = parsed.unwrap_or(AutoPrLoop::DEFAULT_RUN_DEADLINE_SECS).max(1_800);
-    std::time::Duration::from_secs(secs)
-}
-
 impl AutoPrLoop {
     const DEFAULT_INTERVAL_SECS: u64 = 1_800;
     const DEFAULT_DAILY_CAP: u32 = 3;
     /// How many consecutive triage-only refusals one tick may clear.
     const MAX_TRIAGE_PER_TICK: u32 = 5;
-    /// 3 h — well past the slowest honest run (a full build + two review
-    /// rounds), well short of the 15 h freeze this bounds (#954).
-    const DEFAULT_RUN_DEADLINE_SECS: u64 = 10_800;
+    /// How long one `run_once` may take before the loop abandons it: past the
+    /// slowest honest run, far short of the 15 h freeze it bounds (#954).
+    const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10_800);
 
     /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
     /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
@@ -7050,24 +7041,16 @@ impl AutoPrLoop {
             let mut triaged = 0u32;
             loop {
                 // #954 — the run is awaited inline, so an unbounded one stops
-                // the whole tick loop (15 h on 2026-09-04). Dropping the
-                // future kills any CLI child (kill_on_drop) and releases its
-                // gate permit; the next tick's preflight cleans up after it.
-                let deadline = run_once_deadline_from(
-                    std::env::var("AUGMENTAGENT_AUTOPR_RUN_TIMEOUT_SECS").ok().as_deref(),
-                );
-                let Ok(outcome) =
-                    tokio::time::timeout(deadline, run_once(&self.repo_root, self.dry_run)).await
-                else {
+                // the tick loop itself (15 h on 2026-09-04). Dropping the
+                // future kills any CLI child and frees its gate permit.
+                let run = run_once(&self.repo_root, self.dry_run);
+                let Ok(outcome) = tokio::time::timeout(Self::RUN_DEADLINE, run).await else {
                     // A harness failure (#803), not the issue's: the day's cap
-                    // is deliberately not charged and no attempt is recorded —
-                    // `run_once` owns picking the issue and never returned, so
-                    // there is nothing here to record it against.
+                    // is deliberately not charged and no attempt recorded.
                     warn!(
-                        timeout_secs = deadline.as_secs(),
+                        timeout_secs = Self::RUN_DEADLINE.as_secs(),
                         kind = FailureKind::Infra.as_str(),
-                        "auto-PR: run abandoned past its deadline; resuming next tick \
-                         (see AUGMENTAGENT_AUTOPR_RUN_TIMEOUT_SECS, #954)"
+                        "auto-PR: run abandoned past its deadline; resuming next tick (#954)"
                     );
                     break;
                 };
@@ -8961,24 +8944,18 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
     /// #954 — the tick loop awaits `run_once` inline, so a wedged run stops
-    /// the loop itself (on 2026-09-04 it stopped for 15 h). Structural: the
-    /// await must be bounded, and the expiry must not bill the day's cap for
-    /// a run the harness abandoned (#803).
+    /// the loop itself (15 h on 2026-09-04). Structural: the await must be
+    /// bounded, and its expiry must not bill the day's cap (#803).
     #[test]
     fn autopr_run_once_await_is_bounded() {
         let src = include_str!("self_improve.rs");
-        let awaited = "tokio::time::timeout(deadline, run_once(&self.repo_root";
-        let arm = src.split(awaited).nth(1).expect("run_once must be awaited");
+        let awaited = "tokio::time::timeout(Self::RUN_DEADLINE, run).await";
+        let arm = src.split(awaited).nth(1).expect("run_once must be awaited on a deadline");
         let arm = &arm[..arm.find("\n                };").expect("expiry arm")];
         assert!(
             arm.contains("FailureKind::Infra") && !arm.contains("counter.record("),
             "an abandoned run is an unbilled harness failure, not the issue's fault"
         );
-        let secs = |raw| run_once_deadline_from(raw).as_secs();
-        assert_eq!(secs(None), AutoPrLoop::DEFAULT_RUN_DEADLINE_SECS);
-        assert_eq!(secs(Some(" 7200 ")), 7_200);
-        // A too-small value would abandon healthy runs mid-build.
-        assert_eq!(secs(Some("5")), 1_800);
     }
 
     // Structural: in run_once's gate-failure arm the baseline comparison

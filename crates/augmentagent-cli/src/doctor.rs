@@ -742,16 +742,14 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
     }
 }
 
-/// #954 — the #898 CLI gate is process-global inside the daemon, so doctor
-/// reads the snapshot it leaves behind: a permit held far past the longest
-/// legitimate call, or a snapshot no longer being refreshed, is the
-/// 2026-09-04 freeze — and nothing else in the box says so.
+/// #954 — the #898 CLI gate lives inside the daemon, so doctor reads the
+/// snapshot it leaves behind: a permit held far past the longest legitimate
+/// call, or a snapshot no longer refreshed, is the 2026-09-04 freeze.
 fn check_reasoner_gate() -> Finding {
     let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
-    let now = elapsed.map_or(0, |d| d.as_secs());
     // Three watchdog budgets: past that no honest call is still running.
     let stuck_after = augmentagent_channel_core::reasoner::reasoner_timeout().as_secs() * 3;
-    gate_finding(cli_gate::read_snapshot(), now, stuck_after)
+    gate_finding(cli_gate::read_snapshot(), elapsed.map_or(0, |d| d.as_secs()), stuck_after)
 }
 
 fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64) -> Finding {
@@ -760,13 +758,12 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64, stuck_after: u64
         return Finding::ok("reasoner_gate", "no reasoner CLI call yet this boot");
     };
     if !PathBuf::from(format!("/proc/{}", s.pid)).exists() {
-        let msg = format!("stale snapshot from pid {} (no longer running)", s.pid);
-        return Finding::ok("reasoner_gate", msg);
+        return Finding::ok("reasoner_gate", format!("stale snapshot from pid {}", s.pid));
     }
     let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
-    // The daemon's hold watchdog rewrites this every sweep while anything is
-    // held, so a live pid with a stale snapshot means the sweep itself stopped
-    // — the counts above can no longer be believed, whatever they say.
+    // The hold watchdog rewrites this every sweep while anything is held, so a
+    // live pid with a stale snapshot means the sweep itself stopped — and then
+    // the counts above cannot be believed.
     let quiet_for = now.saturating_sub(s.updated_unix);
     if s.in_flight > 0 && quiet_for > cli_gate::WATCHDOG_EVERY.as_secs() * 3 {
         let msg = format!("{state}; gate snapshot {quiet_for}s stale — watchdog not sweeping");
@@ -1139,9 +1136,8 @@ mod tests {
         assert!(dark.message.contains("codex"), "{}", dark.message);
     }
 
-    /// #954 — doctor must be able to say "the gate is wedged". The freeze
-    /// shape: every slot held, callers queued, oldest permit hours old. Our
-    /// own pid, so the liveness probe sees a running process.
+    /// #954 — doctor must be able to say "the gate is wedged": every slot
+    /// held, callers queued, oldest permit hours old, under a live pid.
     #[test]
     fn gate_finding_flags_a_wedged_gate() {
         let now = 100_000u64;
@@ -1154,7 +1150,6 @@ mod tests {
             oldest_since_unix: Some(now - held_for),
             updated_unix: now, // the watchdog sweeps; it is the holds that stick
         };
-
         let stuck = gate_finding(Some(wedged(54_000)), now, 10_800);
         assert_eq!(stuck.severity, Severity::Warn);
         let want = "in_flight 4/4, waiting 7; oldest permit (claude) held 54000s";

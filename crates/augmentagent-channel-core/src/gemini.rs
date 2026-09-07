@@ -80,8 +80,7 @@ impl GeminiCliReasoner {
         user_message: &str,
     ) -> anyhow::Result<String> {
         let dur = reasoner_timeout();
-        // #898 — CLI slot taken before the watchdog starts (see cli_gate), and
-        // #954 — bounded by the same budget, so a jammed gate fails over.
+        // #898 — CLI slot before the watchdog starts; #954 — bounded wait.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("gemini", &caller, dur);
         let _permit = acquire.await.map_err(ReasonerError::from)?;

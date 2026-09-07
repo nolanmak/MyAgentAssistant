@@ -10,8 +10,8 @@
 //! The gate is a semaphore shared by every reasoner instance in the
 //! process — each channel builds its own reasoner, so a per-instance limit
 //! would not help. Callers beyond the capacity *wait*: ingest is
-//! best-effort and already async, so queueing is the correct backpressure
-//! (bounded since #954, below). A permit is taken immediately before
+//! best-effort and already async, so queueing is the correct backpressure;
+//! bounded since #954 (below). A permit is taken immediately before
 //! `Command::spawn` and lives in the same scope as the `Child`, so it is
 //! released when the child is reaped, on every early-return error, and when
 //! the caller's future is dropped (the #656 watchdog, shutdown).
@@ -20,12 +20,9 @@
 //! read once when the global gate is first used.
 //!
 //! #954 — on 2026-09-04 four permits were held by futures that were neither
-//! running a child nor timing out, and every reasoner call in the daemon
-//! queued behind them for 15 h: no email triage, no auto-PR loop, no log
-//! line. So: the wait is bounded by the caller's own #656 budget; an
-//! independent watchdog task — not the next caller, who may never come —
-//! names holds past that budget, reclaims their slots, and publishes
-//! [`snapshot_path`] for `augmentagent doctor`, which runs in its own process.
+//! running a child nor timing out, and every reasoner call queued behind them
+//! for 15 h: no email triage, no auto-PR loop, no log line. So the wait is
+//! bounded, it says so while it lasts, and a watchdog reclaims overdue holds.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,15 +37,13 @@ use tracing::{info, warn};
 
 pub const DEFAULT_MAX_INFLIGHT: usize = 4;
 pub const ENV_MAX_INFLIGHT: &str = "AUGMENTAGENT_REASONER_MAX_INFLIGHT";
-/// A saturated gate logs at most once per this interval — a 1,700-item
-/// burst must not become 1,700 log lines.
-const SATURATION_WARN_EVERY: Duration = Duration::from_secs(60);
+/// How long one call may sit queued in silence, and the floor between lines.
+const QUEUED_WARN_EVERY: Duration = Duration::from_secs(60);
 /// A permit held this many times its caller's budget has no live child behind
-/// it — #656 kills at 1× and drops the permit with the future.
+/// it — #656 kills at 1×, dropping the permit with the future.
 const STALE_HOLD_FACTOR: u32 = 2;
-/// Upper bound on the hold watchdog's sweep period (it also sweeps at the
-/// shortest budget it polices). Doubles as the snapshot's heartbeat: while
-/// anything is held, an older snapshot means the sweep itself stopped.
+/// Sweep-period ceiling, and so the snapshot's heartbeat: an older snapshot
+/// with holds outstanding means the sweep itself stopped.
 pub const WATCHDOG_EVERY: Duration = Duration::from_secs(30);
 
 /// A caller gave up waiting for a permit — ours, not the provider's fault.
@@ -59,11 +54,10 @@ pub struct GateWaitTimeout {
     pub waited_secs: u64,
 }
 
-/// One permit out, tracked so a hold outliving its caller's budget can be
-/// named and reclaimed (#954).
+/// One permit out, so a hold outliving its budget can be named (#954).
 struct Held {
     provider: String,
-    /// Which preset asked — "claude" alone cannot say *which* call leaked.
+    /// Which preset asked: "claude" cannot say *which* call leaked.
     caller: String,
     since: Instant,
     budget: Duration,
@@ -77,6 +71,9 @@ pub struct CliGate {
     next_id: AtomicU64,
     waiting: AtomicUsize,
     last_warn_ms: AtomicU64,
+    /// A field, not the const, so tests can compress a minute to milliseconds.
+    warn_every: Duration,
+    queued_warnings: AtomicU64,
     /// Whether a hold-watchdog task is live for this gate.
     sweeping: AtomicBool,
     overdue: AtomicU64,
@@ -95,6 +92,8 @@ impl CliGate {
             next_id: AtomicU64::new(0),
             waiting: AtomicUsize::new(0),
             last_warn_ms: AtomicU64::new(0),
+            warn_every: QUEUED_WARN_EVERY,
+            queued_warnings: AtomicU64::new(0),
             sweeping: AtomicBool::new(false),
             overdue: AtomicU64::new(0),
             reclaimed: AtomicU64::new(0),
@@ -127,8 +126,7 @@ impl CliGate {
         self.held().len()
     }
 
-    /// The permit held longest, and for how long — without it a wedged gate is
-    /// invisible, as the 15 h freeze was (#954). `None` when idle.
+    /// The permit held longest, and for how long; `None` when idle (#954).
     pub fn oldest_held(&self) -> Option<(String, Duration)> {
         self.held()
             .values()
@@ -146,18 +144,20 @@ impl CliGate {
         self.waiting.load(Ordering::SeqCst)
     }
 
-    /// Holds named past their caller's budget — test visibility for a watchdog
-    /// that otherwise only speaks to the log.
+    /// Test visibility for what otherwise only reaches the log: holds named
+    /// past their budget, and lines about a caller still queued.
     pub fn overdue_reports(&self) -> u64 {
         self.overdue.load(Ordering::Relaxed)
     }
 
+    pub fn queued_warnings(&self) -> u64 {
+        self.queued_warnings.load(Ordering::Relaxed)
+    }
+
     /// Wait for a slot for at most `max_wait` — the caller's own watchdog
-    /// budget, so a queued call fails the same way a hung child does instead
-    /// of blocking forever (#954); there is deliberately no unbounded acquire,
-    /// since that is precisely the freeze. `max_wait` doubles as the budget
-    /// the permit promises to finish inside, policed by the watchdog armed
-    /// below, which names the holder by its `caller` preset.
+    /// budget, so a queued call fails the way a hung child does instead of
+    /// blocking forever (#954). It doubles as the budget the permit promises
+    /// to finish inside, policed by the watchdog below.
     pub async fn acquire_timed(
         self: &Arc<Self>,
         provider: &str,
@@ -165,61 +165,44 @@ impl CliGate {
         max_wait: Duration,
     ) -> Result<CliPermit, GateWaitTimeout> {
         let started = Instant::now();
+        let deadline = started + max_wait;
         let queued = WaitGuard::enter(self);
-        if self.waiting() > self.capacity {
-            self.warn_saturated(provider);
-        }
-        // Cancel-safe: on the deadline the acquire future is dropped, leaving
-        // the semaphore's FIFO queue without ever having taken a permit.
-        let Ok(granted) =
-            tokio::time::timeout(max_wait, Arc::clone(&self.sem).acquire_owned()).await
-        else {
-            let waited_secs = started.elapsed().as_secs();
-            let (holder, held_secs) = self
-                .oldest_held()
-                .map_or_else(|| ("none".to_string(), 0), |(p, age)| (p, age.as_secs()));
-            warn!(
-                provider,
-                caller,
-                waited_secs,
-                in_flight = self.in_flight(),
-                waiting = self.waiting(),
-                oldest_holder = holder,
-                oldest_held_secs = held_secs,
-                "reasoner CLI gate wait timed out; giving up on this call (#954)"
-            );
-            let provider = provider.to_string();
-            return Err(GateWaitTimeout { provider, waited_secs });
+        // Waited in slices, not one `timeout`: a caller stuck behind a leaked
+        // permit must say so every `warn_every`, not only when it gives up —
+        // the freeze never queued more callers than the gate is wide, so a
+        // depth-gated warning stayed silent for all 15 h. Carrying (never
+        // re-creating) the future keeps the caller's place in the FIFO queue.
+        let acquire = Arc::clone(&self.sem).acquire_owned();
+        tokio::pin!(acquire);
+        let granted = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let slice = left.min(self.warn_every);
+            match tokio::time::timeout(slice, &mut acquire).await {
+                Ok(granted) => break granted.expect("CLI gate semaphore is never closed"),
+                Err(_) if slice < left => self.warn_queued(provider, caller, started, false),
+                Err(_) => {
+                    self.warn_queued(provider, caller, started, true);
+                    let (provider, waited_secs) =
+                        (provider.to_string(), started.elapsed().as_secs());
+                    return Err(GateWaitTimeout { provider, waited_secs });
+                }
+            }
         };
         // Stop counting this caller as queued *before* publishing, or `doctor`
-        // reads a `waiting` that includes the caller who just got in; from
-        // here the watchdog's heartbeat keeps that count fresh, and a later
-        // waiter can only exist while permits are held, i.e. while it sweeps.
+        // reads a `waiting` that includes the caller who just got in.
         drop(queued);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let held = Held {
-            provider: provider.to_string(),
-            caller: caller.to_string(),
-            since: Instant::now(),
-            budget: max_wait,
-            warned: false,
-        };
-        self.held().insert(id, held);
+        let (provider, caller) = (provider.to_string(), caller.to_string());
+        let (since, budget) = (Instant::now(), max_wait);
+        self.held().insert(id, Held { provider, caller, since, budget, warned: false });
         self.arm_watchdog();
         self.write_snapshot();
-        Ok(CliPermit {
-            permit: Some(granted.expect("CLI gate semaphore is never closed")),
-            gate: Arc::clone(self),
-            id,
-        })
+        Ok(CliPermit { permit: Some(granted), gate: Arc::clone(self), id })
     }
 
-    /// One sweeper task per gate, armed by the first grant and living as long
-    /// as the gate. Without it a leak is only ever noticed by the *next*
-    /// acquire — and "there is no next call" is exactly the #954 freeze: every
-    /// caller timed out and left, and the four leaked permits were found 15 h
-    /// later, by a human. Its snapshot write is the heartbeat that lets
-    /// `doctor` tell a swept gate from a stopped one.
+    /// One sweeper task per gate, armed by the first grant. Without it a leak
+    /// is only noticed by the *next* acquire — and "there is no next call" is
+    /// exactly #954: every caller left, and a human found the leak 15 h later.
     fn arm_watchdog(self: &Arc<Self>) {
         if self.sweeping.swap(true, Ordering::SeqCst) {
             return;
@@ -234,8 +217,8 @@ impl CliGate {
         });
     }
 
-    /// Sweep at least as often as the shortest budget being policed, so a
-    /// leaked slot returns near its own deadline, not the next half-minute.
+    /// Sweep at the shortest budget policed: a leaked slot must come back near
+    /// its own deadline, not at the next half-minute.
     fn sweep_period(&self) -> Duration {
         self.held()
             .values()
@@ -245,12 +228,10 @@ impl CliGate {
             .clamp(Duration::from_millis(10), WATCHDOG_EVERY)
     }
 
-    /// One watchdog pass. A permit past its caller's own budget is named once
-    /// — #656 kills a live child at 1×, so a longer hold has nothing behind it
-    /// — and past [`STALE_HOLD_FACTOR`]× its slot is handed back, since a leak
-    /// must not narrow the gate for the life of the process. The holder's
-    /// `Drop` then forgets its permit rather than returning it, so the total
-    /// never exceeds `capacity`.
+    /// One watchdog pass. A hold past its caller's budget is named once (#656
+    /// kills a live child at 1×, so a longer hold has nothing behind it), and
+    /// past [`STALE_HOLD_FACTOR`]× its slot is handed back — its `Drop` then
+    /// forgets the permit, so the total never exceeds `capacity`.
     fn sweep_holds(&self) {
         let mut freed = 0usize;
         self.held().retain(|_, h| {
@@ -285,8 +266,7 @@ impl CliGate {
     }
 
     /// Publish the gate's state for `augmentagent doctor`, which runs in its
-    /// own process and can otherwise see nothing. One short tmpfs line,
-    /// best-effort — a diagnostic must never fail or slow a reasoner call.
+    /// own process. Best-effort: a diagnostic must never fail a reasoner call.
     fn write_snapshot(&self) {
         let Some(path) = self.snapshot_to.as_ref() else {
             return;
@@ -310,24 +290,38 @@ impl CliGate {
         }
     }
 
-    fn warn_saturated(&self, provider: &str) {
-        let now = now_ms();
-        let last = self.last_warn_ms.load(Ordering::Relaxed);
-        let due = now.saturating_sub(last) >= SATURATION_WARN_EVERY.as_millis() as u64;
-        if due
-            && self
-                .last_warn_ms
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            warn!(
-                provider,
-                waiting = self.waiting(),
-                in_flight = self.in_flight(),
-                capacity = self.capacity,
-                "reasoner CLI gate saturated; calls are queueing (see {ENV_MAX_INFLIGHT})"
+    /// Name a caller that is still queued — every `warn_every` it waits, and
+    /// once more if it gives up. Never gated on queue depth, and it names the
+    /// hold it is stuck behind: the diagnosis #954 never printed.
+    fn warn_queued(&self, provider: &str, caller: &str, started: Instant, gave_up: bool) {
+        if !gave_up {
+            // One line per interval per gate: a 1,700-item burst must not
+            // become 1,700 lines.
+            let (now, every) = (now_ms(), self.warn_every.as_millis() as u64);
+            let claimed = self.last_warn_ms.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |last| (now.saturating_sub(last) >= every).then_some(now),
             );
+            if claimed.is_err() {
+                return;
+            }
+            self.queued_warnings.fetch_add(1, Ordering::Relaxed);
         }
+        let (holder, held_secs) = self
+            .oldest_held()
+            .map_or_else(|| ("none".to_string(), 0), |(p, age)| (p, age.as_secs()));
+        warn!(
+            provider,
+            caller,
+            gave_up,
+            waited_secs = started.elapsed().as_secs(),
+            waiting = self.waiting(),
+            in_flight = self.in_flight(),
+            oldest_holder = holder,
+            oldest_held_secs = held_secs,
+            "reasoner CLI gate: call queued behind held permits (#954, {ENV_MAX_INFLIGHT})"
+        );
     }
 }
 
@@ -342,8 +336,7 @@ impl Drop for CliPermit {
     fn drop(&mut self) {
         if self.gate.held().remove(&self.id).is_none() {
             // Gone from the map means the watchdog already handed this slot
-            // back; returning it twice would widen the gate past capacity —
-            // the #897 OOM it exists to prevent.
+            // back; returning it twice widens the gate past capacity (#897).
             if let Some(p) = self.permit.take() {
                 p.forget();
             }
@@ -360,13 +353,11 @@ pub struct GateSnapshot {
     pub in_flight: usize,
     pub waiting: usize,
     pub oldest_provider: Option<String>,
-    /// Unix seconds at which the oldest still-held permit was granted.
     pub oldest_since_unix: Option<u64>,
     pub updated_unix: u64,
 }
 
-/// `${XDG_RUNTIME_DIR}/augmentagent/reasoner-gate.json` — tmpfs, so it cannot
-/// outlive its boot.
+/// `${XDG_RUNTIME_DIR}/augmentagent/reasoner-gate.json` — tmpfs, so per boot.
 pub fn snapshot_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(dir).join("augmentagent/reasoner-gate.json")
@@ -412,7 +403,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    /// The default budget for tests that only care about slot bookkeeping.
+    /// Budget for tests that only care about slot bookkeeping.
     const BUDGET: Duration = Duration::from_secs(90);
 
     #[tokio::test]
@@ -448,17 +439,17 @@ mod tests {
         assert_eq!(gate.in_flight(), 0);
     }
 
-    /// #954 verbatim: capacity 4, all four permits held by futures that will
-    /// never drop them, so every reasoner call in the daemon queues behind
-    /// them — 15 h with no email triage, no auto-PR loop and no log line. The
-    /// one caller that does arrive then gives up and leaves, so from there
-    /// **nothing calls the gate again**: recovery cannot depend on a later
-    /// acquire. Real clock at ms scale — tokio's paused clock needs
-    /// `test-util`, which forks the tokio-dependent build graph in two.
+    /// #954 verbatim: capacity 4, all four permits held by futures that never
+    /// drop them, so every reasoner call queues behind them — 15 h with no
+    /// email triage, no auto-PR loop and no log line. The one caller that does
+    /// arrive gives up and leaves, so **nothing calls the gate again**:
+    /// neither the warning nor the recovery may wait for a later acquire.
     #[tokio::test]
     async fn leaked_permits_are_reported_and_reclaimed_without_a_later_acquire() {
-        let gate = Arc::new(CliGate::new(DEFAULT_MAX_INFLIGHT));
         let budget = Duration::from_millis(300);
+        let mut gate = CliGate::new(DEFAULT_MAX_INFLIGHT);
+        gate.warn_every = budget / 5;
+        let gate = Arc::new(gate);
         let mut leaked = Vec::new();
         for _ in 0..DEFAULT_MAX_INFLIGHT {
             leaked.push(gate.acquire_timed("claude", "triage", budget).await.unwrap());
@@ -469,9 +460,18 @@ mod tests {
         assert_eq!(err.provider, "claude");
         assert_eq!(gate.waiting(), 0, "timed-out waiter must not stay counted");
         assert_eq!(gate.oldest_held().expect("four are held").0, "claude");
+        // One call behind four stuck holds never makes the queue deeper than
+        // the gate, so it has to name itself *while waiting*: waiting for it
+        // to give up is the 15 h of silence, at scale.
+        assert!(
+            gate.queued_warnings() >= 2,
+            "a still-queued caller must be named every interval it waits, not \
+             only when it finally times out (saw {})",
+            gate.queued_warnings()
+        );
 
-        // Not one more acquire from here: the watchdog task alone must name the
-        // leak and hand the slots back, or the gate stays narrowed for good.
+        // Not one more acquire from here: the watchdog task alone must name
+        // the leak and hand the slots back, or the gate stays narrow for good.
         let deadline = Instant::now() + budget * 10;
         while gate.reclaimed() < DEFAULT_MAX_INFLIGHT as u64 && Instant::now() < deadline {
             tokio::time::sleep(budget / 4).await;
@@ -481,8 +481,7 @@ mod tests {
         assert_eq!(gate.overdue_reports(), DEFAULT_MAX_INFLIGHT as u64);
         assert!(gate.oldest_held().is_none());
 
-        // The reclaimed holders forget their permits on drop, so capacity is
-        // restored exactly — never widened — and the gate takes calls again.
+        // Reclaimed holders forget their permits, so capacity is exact.
         drop(leaked);
         assert_eq!(gate.sem.available_permits(), DEFAULT_MAX_INFLIGHT);
         gate.acquire_timed("claude", "triage", budget).await.expect("gate is usable");
