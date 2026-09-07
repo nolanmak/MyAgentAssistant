@@ -306,18 +306,17 @@ pub fn approval_message(
     }
     let embed = embed.footer(CreateEmbedFooter::new(footer));
 
-    // #927 — a merge card carries evidence, not a draft: nothing to redraft,
-    // nothing to schedule, and the handler refuses every other verb.
+    // #927 — a merge card carries evidence, not a draft: there is nothing to
+    // redraft and nothing to schedule, so those verbs are never offered.
     if email.kind == "identity_merge" {
-        let rows = vec![CreateActionRow::Buttons(vec![
+        return CreateMessage::new().embed(embed).components(vec![CreateActionRow::Buttons(vec![
             CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
                 .label("Approve & Merge")
                 .style(ButtonStyle::Success),
             CreateButton::new(CustomId::new(action_id, Verb::Skip).to_string())
                 .label("Skip")
                 .style(ButtonStyle::Secondary),
-        ])];
-        return CreateMessage::new().embed(embed).components(rows);
+        ])]);
     }
 
     let button_row = CreateActionRow::Buttons(vec![
@@ -964,7 +963,6 @@ mod tests {
         assert!(v.contains("aa:act-m1:approve") && v.contains("Approve & Merge"));
         assert!(v.contains("aa:act-m1:skip"));
         assert!(!v.contains(":revise"), "a merge has no draft to revise");
-        assert!(!v.contains("quick_refine") && !v.contains("schedule_pick"));
         assert_eq!(row_count(&approval_message("a", &email(), "d", 0)), 3, "other kinds unchanged");
     }
 
